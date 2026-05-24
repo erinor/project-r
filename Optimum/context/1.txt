@@ -1,0 +1,322 @@
+To achieve your goal completely natively (without Termux or Bash) and strictly
+honoring your rules, we need three core components in Kotlin:
+
+1.  ApkOptimizer: A faithful translation of your Python logic using Kotlin’s
+    File API, Regex, and collections.
+2.  OptimizationEngine: The wrapper around the Apktool Java API that skips .dex
+    decoding, sets the framework path, overrides the AAPT2 binary, and triggers
+    the rebuild.
+3.  MainActivity (Storage Access): Android 11+ Scoped Storage requires us to
+    pick the file via ActivityResultContracts and stream its content to a native
+    File inside the app's isolated cacheDir (since Apktool requires
+    java.io.File, not content:// URIs).
+
+Below is the complete, modular Kotlin codebase to achieve this.
+
+1. The Cleanup Logic (ApkOptimizer.kt)
+
+This handles your Python sorting, DPI deduplication, and Regex evaluations
+cleanly using Kotlin's walkBottomUp() and groupingBy capabilities.
+
+import java.io.File
+
+object ApkOptimizer {
+    private const val MAX_SW_DP = 400
+    private const val MAX_DIMENSION_DP = 800
+    private val DENSITY_PRIORITY = mapOf(
+        "ldpi" to 0, "mdpi" to 1, "hdpi" to 2, "xhdpi" to 3, "xxhdpi" to 4, "xxxhdpi" to 5
+    )
+    private val TARGET_FOLDERS = setOf("drawable", "mipmap")
+    private val KEEP_LANGS = setOf("en", "bn")
+
+    private val langRegex1 = Regex("^([a-z]{2,3})$")
+    private val langRegex2 = Regex("^([a-z]{2,3})-r[A-Z]{2,3}$")
+    private val langRegex3 = Regex("^b\\+([a-zA-Z0-9]+)(?:\\+.*)?$")
+
+    private fun isLanguageQualifier(qualifier: String): Pair<Boolean, String> {
+        if (qualifier == "tv" || qualifier == "car") return false to ""
+
+        langRegex1.matchEntire(qualifier)?.let { return true to it.groupValues[1] }
+        langRegex2.matchEntire(qualifier)?.let { return true to it.groupValues[1] }
+        langRegex3.matchEntire(qualifier)?.let { return true to it.groupValues[1].lowercase() }
+
+        return false to ""
+    }
+
+    private data class ParsedFolder(
+        val drop: Boolean,
+        val density: String? = null,
+        val densityRank: Int = -1,
+        val familyKey: String = ""
+    )
+
+    private fun parseResourceFolder(folderName: String): ParsedFolder? {
+        val parts = folderName.split("-")
+        val baseType = parts[0]
+        val qualifiers = parts.drop(1)
+
+        // 1. GLOBAL GARBAGE DISPOSAL
+        if (qualifiers.any { it == "watch" || it == "tv" || it == "car" }) {
+            return ParsedFolder(drop = true)
+        }
+
+        // Drop tablet/large screen variants
+        for (q in qualifiers) {
+            Regex("^sw(\\d+)dp$").matchEntire(q)?.let {
+                if (it.groupValues[1].toInt() > MAX_SW_DP) return ParsedFolder(drop = true)
+            }
+            Regex("^w(\\d+)dp$").matchEntire(q)?.let {
+                if (it.groupValues[1].toInt() > MAX_DIMENSION_DP) return ParsedFolder(drop = true)
+            }
+            Regex("^h(\\d+)dp$").matchEntire(q)?.let {
+                if (it.groupValues[1].toInt() > MAX_DIMENSION_DP) return ParsedFolder(drop = true)
+            }
+
+            // 2. LANGUAGE CHECK
+            val (isLang, baseLang) = isLanguageQualifier(q)
+            if (isLang && baseLang !in KEEP_LANGS) {
+                return ParsedFolder(drop = true)
+            }
+        }
+
+        // 3. DENSITY DEDUPLICATION
+        if (baseType !in TARGET_FOLDERS) return null
+
+        val density = qualifiers.firstOrNull { it in DENSITY_PRIORITY }
+        val familyQualifiers = qualifiers.filter { it != density }.sorted().joinToString("-")
+
+        return ParsedFolder(
+            drop = false,
+            density = density,
+            densityRank = DENSITY_PRIORITY[density] ?: -1,
+            familyKey = "$baseType-$familyQualifiers"
+        )
+    }
+
+    private data class ResEntry(
+        val file: File,
+        val filename: String,
+        val density: String?,
+        val densityRank: Int,
+        val familyKey: String,
+        val drop: Boolean
+    )
+
+    fun cleanResFolder(resDir: File) {
+        if (!resDir.exists() || !resDir.isDirectory) return
+        val entries = mutableListOf<ResEntry>()
+
+        // Scan files
+        resDir.listFiles()?.forEach { folder ->
+            if (folder.isDirectory) {
+                val parsed = parseResourceFolder(folder.name)
+                if (parsed != null) {
+                    folder.listFiles()?.forEach { file ->
+                        if (file.isFile) {
+                            entries.add(
+                                ResEntry(
+                                    file = file,
+                                    filename = file.name,
+                                    density = parsed.density,
+                                    densityRank = parsed.densityRank,
+                                    familyKey = parsed.familyKey,
+                                    drop = parsed.drop
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        val densityGroups = mutableMapOf<Pair<String, String>, MutableList<ResEntry>>()
+        val toRemove = mutableSetOf<File>()
+
+        // Group entries
+        for (e in entries) {
+            if (e.drop) {
+                toRemove.add(e.file)
+            } else if (e.density != null) {
+                val key = Pair(e.familyKey, e.filename)
+                densityGroups.getOrPut(key) { mutableListOf() }.add(e)
+            }
+        }
+
+        // Evaluate Density Duplicates
+        for (items in densityGroups.values) {
+            if (items.size > 1) {
+                // Keep the highest density rank, drop the rest (index 1 to end)
+                val itemsSorted = items.sortedByDescending { it.densityRank }
+                for (i in 1 until itemsSorted.size) {
+                    toRemove.add(itemsSorted[i].file)
+                }
+            }
+        }
+
+        // 4. DELETE
+        toRemove.forEach { it.delete() }
+
+        // 5. Cleanup empty directories bottom-up
+        resDir.walkBottomUp().forEach { dir ->
+            if (dir.isDirectory && dir.listFiles()?.isEmpty() == true) {
+                dir.delete()
+            }
+        }
+    }
+}
+
+2. Apktool Wrapper & Pipeline (OptimizationEngine.kt)
+
+This handles the heavy lifting with Apktool's Native APIs (ApkDecoder and
+ApkBuilder), sets the custom AAPT2 override path, and forces a dedicated
+framework directory to bypass Android's system permissions constraints.
+
+(Note: The exact configuration method varies slightly between Apktool 2.7.x
+and 2.9.x. The code below targets your requested syntax
+ApkDecoder.DECODE_SOURCES_NONE standard to Apktool < 2.8.0.)
+
+import android.content.Context
+import brut.androlib.ApkBuilder
+import brut.androlib.ApkDecoder
+import brut.androlib.ApkOptions
+import java.io.File
+
+class OptimizationEngine(private val context: Context) {
+
+    fun runPipeline(inputFile: File, outputFile: File): Boolean {
+        val workDir = File(context.cacheDir, "decoded_workspace")
+        if (workDir.exists()) workDir.deleteRecursively()
+        if (outputFile.exists()) outputFile.delete()
+
+        try {
+            // Setup local framework directory (Prevents Apktool writing to blocked Android root paths)
+            val frameworkDir = File(context.filesDir, "apktool_framework")
+            if (!frameworkDir.exists()) frameworkDir.mkdirs()
+
+            // Path to your standalone ARM64 aapt2 binary inside internal storage
+            val aapt2File = File(context.filesDir, "aapt2")
+            if (!aapt2File.exists()) {
+                throw IllegalStateException("AAPT2 binary not found! Please bundle and copy it to filesDir.")
+            }
+            // Vital: Ensure native binary is executable!
+            aapt2File.setExecutable(true)
+
+            // --- 1. DECOMPILE ---
+            val decoder = ApkDecoder()
+            decoder.setApkFile(inputFile)
+            decoder.setOutDir(workDir)
+            decoder.setDecodeSources(ApkDecoder.DECODE_SOURCES_NONE) // Your optimization flag
+            decoder.setFrameworkDir(frameworkDir.absolutePath)
+            decoder.decode()
+
+            // --- 2. CLEANUP ---
+            val resDir = File(workDir, "res")
+            ApkOptimizer.cleanResFolder(resDir)
+
+            // --- 3. REBUILD ---
+            val options = ApkOptions()
+            options.useAapt2 = true
+            options.aaptPath = aapt2File.absolutePath // OVERRIDING AAPT2 HERE
+            options.frameworkFolderLocation = frameworkDir.absolutePath
+            // options.forceDeleteFramework = true // Uncomment if rebuilding acts stubborn
+
+            val builder = ApkBuilder(options)
+            builder.build(workDir, outputFile)
+
+            // Cleanup workspace
+            workDir.deleteRecursively()
+            return true
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return false
+        }
+    }
+}
+
+Note on Apktool > 2.8.0: If you are using Apktool 2.8.0 or newer as your library
+dependency, the config logic moved from ApkOptions/ApkDecoder to
+brut.androlib.Config.getDefaultConfig(). Let me know if you need the updated
+Config builder variant.
+
+3. Android 11+ App Integration (MainActivity.kt)
+
+This handles the strict Storage Access Framework constraints for selecting an
+external APK and converting it to the local app environment for native file
+processing.
+
+import android.net.Uri
+import android.os.Bundle
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+
+class MainActivity : AppCompatActivity() {
+
+    // Launcher to pick the initial APK file via Android 11+ SAF
+    private val apkPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        uri?.let { handleApkUri(it) }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // Example: Ensure your AAPT2 exists (usually copied from raw/assets on first launch)
+        copyAapt2FromAssetsIfNeeded()
+
+        // Trigger picker (You would usually attach this to a Button click listener)
+        apkPicker.launch("application/vnd.android.package-archive") // Or "*/*" if picker hides it
+    }
+
+    private fun handleApkUri(uri: Uri) {
+        Toast.makeText(this, "Processing APK...", Toast.LENGTH_SHORT).show()
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val inputFile = File(cacheDir, "input_raw.apk")
+            val outputFile = File(cacheDir, "output_optimized.apk")
+
+            try {
+                // SAF: Safely stream Scoped Storage URI content to a local Java File
+                contentResolver.openInputStream(uri)?.use { input ->
+                    inputFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+
+                val engine = OptimizationEngine(this@MainActivity)
+                val success = engine.runPipeline(inputFile, outputFile)
+
+                withContext(Dispatchers.Main) {
+                    if (success) {
+                        Toast.makeText(this@MainActivity, "Optimized: ${outputFile.length() / 1024} KB", Toast.LENGTH_LONG).show()
+                        // Next step: Use ACTION_CREATE_DOCUMENT to let user save the optimized APK back!
+                    } else {
+                        Toast.makeText(this@MainActivity, "Failed. Check Logcat.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                // Discard raw copy when done to save app storage space
+                if (inputFile.exists()) inputFile.delete()
+            }
+        }
+    }
+
+    private fun copyAapt2FromAssetsIfNeeded() {
+        val aaptFile = File(filesDir, "aapt2")
+        if (!aaptFile.exists()) {
+            assets.open("aapt2_arm64").use { input ->
+                aaptFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            aaptFile.setExecutable(true)
+        }
+    }
+}

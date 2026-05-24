@@ -1,0 +1,115 @@
+Moving to Apktool 3.x.x is actually a fantastic decision. Not only does it
+support Android 14/15/16 and modern AAPT2 workflows much better, but its
+internal architecture was heavily refactored (specifically in PR #3699).
+
+In Apktool 3.0.x, ApkOptions is gone, and the configuration setters on
+ApkDecoder have been stripped out. Everything is now managed via a central
+brut.androlib.Config object, and the constructors for ApkDecoder and ApkBuilder
+have been updated.
+
+The ApkOptimizer.kt (cleanup logic) and MainActivity.kt (scoped storage) code
+from the previous response remain completely identical because they rely purely
+on Kotlin's standard library and Android APIs.
+
+Here is the updated OptimizationEngine.kt adapted specifically for the
+Apktool 3.0.x API.
+
+Updated OptimizationEngine.kt (Apktool 3.x.x)
+
+import android.content.Context
+import brut.androlib.ApkBuilder
+import brut.androlib.ApkDecoder
+import brut.androlib.Config
+import java.io.File
+
+class OptimizationEngine(private val context: Context) {
+
+    fun runPipeline(inputFile: File, outputFile: File): Boolean {
+        // Create an isolated workspace in the app's cache directory
+        val workDir = File(context.cacheDir, "decoded_workspace")
+        if (workDir.exists()) workDir.deleteRecursively()
+        if (outputFile.exists()) outputFile.delete()
+
+        try {
+            // Setup local framework directory (Prevents Apktool writing to blocked Android root paths)
+            val frameworkDir = File(context.filesDir, "apktool_framework")
+            if (!frameworkDir.exists()) frameworkDir.mkdirs()
+
+            // Path to your standalone ARM64 aapt2 binary inside internal storage
+            val aapt2File = File(context.filesDir, "aapt2")
+            if (!aapt2File.exists()) {
+                throw IllegalStateException("AAPT2 binary not found! Please bundle and copy it to filesDir.")
+            }
+            // Vital: Ensure native binary is executable!
+            aapt2File.setExecutable(true)
+
+            // --- 1. CONFIGURATION (Apktool 3.x.x Central Config) ---
+            val config = Config.getDefaultConfig().apply {
+                // Equivalent to '-s': Do not decode sources (classes.dex)
+                decodeSources = Config.DECODE_SOURCES_NONE 
+                
+                // Set the framework directory to our app-safe path
+                frameworkDirectory = frameworkDir.absolutePath
+                
+                // Force AAPT2 and override the binary path to our standalone arm64 file
+                useAapt2 = true
+                aaptPath = aapt2File.absolutePath
+                
+                // Optional but recommended for clean rebuilds
+                forceDeleteFramework = false 
+            }
+
+            // --- 2. DECOMPILE ---
+            // In v3.x, ApkDecoder takes the file and config in the constructor
+            val decoder = ApkDecoder(inputFile, config)
+            decoder.decode(workDir) // Decode directly to the target workspace folder
+
+            // --- 3. CLEANUP ---
+            val resDir = File(workDir, "res")
+            if (resDir.exists()) {
+                ApkOptimizer.cleanResFolder(resDir) // (Uses the class provided in the previous answer)
+            }
+
+            // --- 4. REBUILD ---
+            // In v3.x, ApkBuilder takes the config in the constructor
+            val builder = ApkBuilder(config)
+            builder.build(workDir, outputFile)
+
+            // Cleanup workspace to save storage
+            workDir.deleteRecursively()
+            return true
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            // Make sure to clean up the workspace if a failure occurs
+            if (workDir.exists()) workDir.deleteRecursively()
+            return false
+        }
+    }
+}
+
+Key Changes to Notice for 3.x.x:
+
+1.  brut.androlib.Config: It now acts as the single source of truth for all
+    pipeline settings. You configure it once and pass it to both the decoder and
+    the builder.
+2.  ApkDecoder(File, Config): The decoder now expects the input .apk and the
+    Config instance right at instantiation.
+3.  decoder.decode(File): The output directory is passed dynamically into the
+    decode() method rather than using setOutDir().
+4.  ApkBuilder(Config): Replaces the old ApkBuilder(ApkOptions) setup.
+
+Pro-Tip for Android 15/16 Constraints:
+
+Since you are using a standalone ARM64 aapt2 binary without root, verify that
+your AAPT2 binary isn't compressed inside the APK when you build your Android
+project. Ensure you put the binary in the assets/ folder, and add this to your
+app's build.gradle so Android doesn't compress it (which can corrupt native
+binaries when extracted):
+
+android {
+    // ...
+    aaptOptions {
+        noCompress 'aapt2' // or whatever exact name you give your binary in assets
+    }
+}
